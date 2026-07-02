@@ -1,4 +1,5 @@
 import logging
+from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
@@ -26,7 +27,7 @@ redis_pool = ConnectionPool(
     host=settings.REDIS_HOST,
     port=settings.REDIS_PORT,
     db=settings.REDIS_DB,
-    decode_responses=True  # Automatically processes network streams into UTF-8 strings
+    decode_responses=True
 )
 
 Base = declarative_base()
@@ -47,7 +48,7 @@ def create_elastic_client() -> AsyncElasticsearch:
     )
 
 
-async def get_redis_ctx():
+async def get_redis_ctx() -> AsyncGenerator[Redis, None]:
     """
     Dynamically initializes a loop-bound Redis connection pool.
     Enforces maximum connection limits to protect memory footprints
@@ -74,25 +75,6 @@ async def get_redis_ctx():
         await pool.disconnect()
 
 
-async def get_elastic_ctx():
-    """Yields a request-scoped, safely isolated Elasticsearch client context."""
-    client = create_elastic_client()
-    try:
-        yield client
-    finally:
-        await client.close()
-
-
-async def get_kafka_ctx():
-    """Yields a request-scoped Kafka producer context bound to the active thread."""
-    producer = create_kafka_producer()
-    await producer.start()
-    try:
-        yield producer
-    finally:
-        await producer.stop()
-
-
 async def get_db_session():
     """FastAPI Request Dependency yielding scoped DB connections."""
     async with AsyncSessionLocal() as session:
@@ -107,45 +89,93 @@ def create_kafka_producer() -> AIOKafkaProducer:
     return AIOKafkaProducer(bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS)
 
 
-async def verify_and_setup_elastic_index(es_client: AsyncElasticsearch):
-    """Ensures index configuration with custom morphological text filters exists."""
-    index_exists = await es_client.indices.exists(index=settings.ELASTIC_INDEX)
-    if not index_exists:
-        fallback_mapping = {
-            "mappings": {
-                "properties": {
-                    "text": {"type": "text", "analyzer": "russian"}
-                }
-            }
-        }
-        await es_client.indices.create(index=settings.ELASTIC_INDEX, body=fallback_mapping)
+# app/database.py
 
+# ... (engine, AsyncSessionLocal, redis_pool, Base, create_elastic_client, create_kafka_producer остаются без изменений) ...
 
-# =====================================================================
-# 3. ELASTICSEARCH & KAFKA CLIENTS (Singletons & Dependencies)
-# =====================================================================
 _elastic_client: AsyncElasticsearch | None = None
 _kafka_producer: AIOKafkaProducer | None = None
 
 
 async def init_infrastructure():
-    """Инициализация глобальных клиентов и подготовка индексов при старте приложения."""
+    """
+    Fail-Fast инициализация синглтонов.
+    Вызывается строго один раз при старте приложения внутри lifespan.
+    """
     global _elastic_client, _kafka_producer
 
-    # Инициализация Elasticsearch
-    _elastic_client = AsyncElasticsearch(hosts=[f"http://{settings.ELASTIC_HOST}:{settings.ELASTIC_PORT}"])
+    # 1. Инициализируем глобальный Elasticsearch клиент
+    if _elastic_client is None:
+        _elastic_client = create_elastic_client()
 
-    # Проверка и создание индекса с поддержкой русской морфологии
-    index_exists = await _elastic_client.indices.exists(index=settings.ELASTIC_INDEX)
-    if not index_exists:
-        index_mapping = {
+    # Принудительно настраиваем маппинги и анализаторы до запуска API
+    await verify_and_setup_elastic_index(_elastic_client)
+
+    # 2. Инициализируем и прогреваем глобальный синглтон Kafka Producer
+    if _kafka_producer is None:
+        _kafka_producer = create_kafka_producer()
+        await _kafka_producer.start()
+        print("[Database] Infrastructure singletons initialized and pre-warmed.")
+
+
+async def close_infrastructure():
+    """Безопасное освобождение дескрипторов при завершении работы."""
+    global _elastic_client, _kafka_producer
+    print("[Database] Closing infrastructure connections...")
+
+    if _kafka_producer is not None:
+        await _kafka_producer.stop()
+        _kafka_producer = None
+
+    if _elastic_client is not None:
+        await _elastic_client.close()
+        _elastic_client = None
+
+
+async def get_elastic_client() -> AsyncElasticsearch:
+    """Прямой доступ к синглтону для ETL и тестов."""
+    global _elastic_client
+    if _elastic_client is None:
+        _elastic_client = create_elastic_client()
+    return _elastic_client
+
+
+async def get_kafka_producer() -> AIOKafkaProducer:
+    """Прямой доступ к синглтону."""
+    global _kafka_producer
+    if _kafka_producer is None:
+        _kafka_producer = create_kafka_producer()
+    return _kafka_producer
+
+
+# --- Переписанные контексты-генераторы (Заменяют старые scoped-версии) ---
+
+async def get_elastic_ctx() -> AsyncGenerator[AsyncElasticsearch, None]:
+    """Отдает готовый синглтон без постоянного пересоздания клиента."""
+    yield await get_elastic_client()
+
+
+async def get_kafka_ctx() -> AsyncGenerator[AsyncElasticsearch, None]:
+    """Отдает готовый прогретый синглтон из lifespan (без утечек дескрипторов)."""
+    yield await get_kafka_producer()
+
+
+async def verify_and_setup_elastic_index(es_client: AsyncElasticsearch):
+    """
+    Обеспечивает строгое наличие поискового индекса с русским анализатором.
+    Если создание падает — падает все приложение (Fail-Fast).
+    """
+    index_name = settings.ELASTIC_INDEX
+
+    exists = await es_client.indices.exists(index=index_name)
+    if not exists:
+        print(f"[Elastic] Index '{index_name}' missing. Building morphologic schema mappings...")
+        index_body = {
             "settings": {
                 "analysis": {
                     "analyzer": {
-                        "russian_analyzer": {
-                            "type": "custom",
-                            "tokenizer": "standard",
-                            "filter": ["lowercase", "russian_morphology", "stop"]
+                        "default": {
+                            "type": "russian"
                         }
                     }
                 }
@@ -154,50 +184,17 @@ async def init_infrastructure():
                 "properties": {
                     "text": {
                         "type": "text",
-                        "analyzer": "russian_analyzer"
+                        "analyzer": "russian"
                     }
                 }
             }
         }
-        # Если плагин russian_morphology не установлен в инстансе Elastic,
-        # можно использовать встроенный тип "russian":
-        # "analyzer": "russian" вместо кастомного russian_analyzer.
-        try:
-            await _elastic_client.indices.create(index=settings.ELASTIC_INDEX, body=index_mapping)
-        except Exception:
-            # Фолбэк на дефолтный русский анализатор, если плагин морфологии отсутствует
-            fallback_mapping = {
-                "mappings": {
-                    "properties": {
-                        "text": {"type": "text", "analyzer": "russian"}
-                    }
-                }
-            }
-            await _elastic_client.indices.create(index=settings.ELASTIC_INDEX, body=fallback_mapping)
-
-    # Инициализация Kafka Producer
-    _kafka_producer = AIOKafkaProducer(bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS)
-    await _kafka_producer.start()
-
-
-async def close_infrastructure():
-    """Корректное закрытие соединений при остановке приложения."""
-    global _elastic_client, _kafka_producer
-    if _kafka_producer:
-        await _kafka_producer.stop()
-    if _elastic_client:
-        await _elastic_client.close()
-
-
-async def get_elastic_client() -> AsyncElasticsearch:
-    """FastAPI Dependency for Elasticsearch."""
-    if _elastic_client is None:
-        raise RuntimeError("Elasticsearch client is not initialized.")
-    return _elastic_client
-
-
-async def get_kafka_producer() -> AIOKafkaProducer:
-    """FastAPI Dependency for Kafka Producer."""
-    if _kafka_producer is None:
-        raise RuntimeError("Kafka producer is not initialized.")
-    return _kafka_producer
+        await es_client.indices.create(index=index_name, body=index_body)
+        print(f"[Elastic] Index '{index_name}' successfully provisioned with Russian analyzer.")
+    else:
+        settings_res = await es_client.indices.get_settings(index=index_name)
+        if "russian" not in str(settings_res):
+            raise RuntimeError(
+                f"Critical Error: Elasticsearch index '{index_name}' exists "
+                f"but is missing the required 'russian' analyzer configuration!"
+            )

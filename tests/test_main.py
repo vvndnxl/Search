@@ -324,3 +324,44 @@ async def test_production_document_deletion_cascades(client, raw_csv_documents, 
     assert mock_kafka.sent_messages[0]["key"] == str(target_id).encode("utf-8")
 
 
+@pytest.mark.asyncio
+async def test_document_deletion_publishes_to_kafka(client, db_session):
+    """
+    Проверяет, что при удалении документа:
+    1. Запись исчезает из PostgreSQL.
+    2. Событие удаления корректно публикуется в топик Kafka.
+    """
+    # 1. Закладываем тестовый документ напрямую в тестовую БД
+    from app.models import DocumentModel
+    import datetime
+
+    test_doc = DocumentModel(
+        id=999,
+        rubrics=["Тест"],
+        text="Контрольный текст для проверки удаления",
+        created_date=datetime.datetime.utcnow()
+    )
+    db_session.add(test_doc)
+    await db_session.commit()
+
+    # 2. Вызываем эндпоинт удаления через тестовый клиент HTTPX
+    response = await client.get("/api/v1/search?query=Контрольный")  # Проверяем что он сначала есть
+
+    del_response = await client.delete("/api/v1/document/999")
+    assert del_response.status_code == 202
+
+    # 3. ПРОВЕРКА СЛЕДА KAFKA: Проверяем, что эндпоинт отправил правильное событие в макет
+    # Извлекаем переопределенный мок-продюсер из приложения через его зависимости
+    from app.database import get_kafka_ctx
+    from app.main import app
+
+    # Достаем инстанс макета, который зафиксировал отправку
+    mock_producer = app.dependency_overrides[get_kafka_ctx].__async_wrapped__.__self__
+
+    assert len(mock_producer.sent_messages) > 0
+    last_message = mock_producer.sent_messages[-1]
+
+    assert last_message["topic"] == settings.KAFKA_TOPIC
+    payload = json.loads(last_message["value"].decode("utf-8"))
+    assert payload["action"] == "DELETE"
+    assert payload["id"] == 999

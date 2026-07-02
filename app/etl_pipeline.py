@@ -5,10 +5,40 @@ from datetime import datetime
 from elasticsearch.helpers import async_bulk
 import pathlib
 
-from app.database import AsyncSessionLocal, create_elastic_client
 from app.models import DocumentModel
+from app.database import AsyncSessionLocal, create_elastic_client, engine, Base, verify_and_setup_elastic_index
 
 CHUNK_SIZE = 1000  # Safeguard boundary preventing Out-Of-Memory crashes
+
+
+async def flush_batch(batch_list: list, index_list: list, es_client) -> int:
+    """Helper routine performing execution commits across databases inside a single block."""
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            for item in batch_list:
+                model_inst = item["model"]
+                session.add(model_inst)
+                # Flush assigns sequential database primary IDs immediately
+                await session.flush()
+
+                index_list.append({
+                    "_index": "documents",
+                    "_id": str(model_inst.id),
+                    "text": item["text"]
+                })
+
+    # Perform asynchronous parallel index update streaming inside Elasticsearch
+    success, errors = await async_bulk(client=es_client, actions=index_list)
+    if errors:
+        print(f"[ETL] Alert: Encountered {len(errors)} payload errors during bulk index transfer processing.")
+
+    # МГНОВЕННОЕ ОБНОВЛЕНИЕ ИНДЕКСА ДЛЯ ГАРАНТИРОВАННОЙ ВИДИМОСТИ В SMOKE-ТЕСТАХ
+    try:
+        await es_client.indices.refresh(index="documents")
+    except Exception as ref_err:
+        print(f"[ETL] Warning: Failed to force index refresh: {ref_err}")
+
+    return len(batch_list)
 
 
 async def populate_search_engine_batched(csv_path: str):
@@ -18,8 +48,21 @@ async def populate_search_engine_batched(csv_path: str):
     """
     print(f"[ETL] Initializing pipeline ingestion for source: {csv_path}")
 
+    # =====================================================================
+    # АВТОМАТИЧЕСКАЯ ИДЕМПОТЕНТНАЯ ИНИЦИАЛИЗАЦИЯ И Fail-Fast ВАЛИДАЦИЯ
+    # =====================================================================
+    print("[ETL] Aligning database schema structures...")
+    async with engine.begin() as conn:
+        # Создаем таблицы в Postgres (включая наш B-Tree индекс на созданную дату), если их нет
+        await conn.run_sync(Base.metadata.create_all)
+
     # Instantiate isolated client dedicated exclusively to this runtime thread
     es_client = create_elastic_client()
+
+    print("[ETL] Verifying search index morphology constraints...")
+    # Принудительно настраиваем или валидируем индекс Elasticsearch с русским морфологическим анализатором
+    await verify_and_setup_elastic_index(es_client)
+    print("[ETL] Structural foundation aligned successfully. Starting file parsing stream...")
 
     current_batch_docs = []
     documents_to_index = []
@@ -62,33 +105,6 @@ async def populate_search_engine_batched(csv_path: str):
 
     await es_client.close()
     print(f"[ETL] Ingestion process complete. Successfully pipeline-routed {total_counter} total entries.")
-
-
-async def flush_batch(batch_list: list, index_list: list, es_client) -> int:
-    """Helper routine performing execution commits across databases inside a single block."""
-    async with AsyncSessionLocal() as session:
-        async with session.begin():
-            for item in batch_list:
-                model_inst = item["model"]
-                session.add(model_inst)
-                # Flush assigns sequential database primary IDs immediately
-                await session.flush()
-
-                index_list.append({
-                    "_index": "documents",
-                    "_id": str(model_inst.id),
-                    "text": item["text"]
-                })
-
-    # Perform asynchronous parallel index update streaming inside Elasticsearch
-    success, errors = await async_bulk(client=es_client, actions=index_list)
-    if errors:
-        print(f"[ETL] Alert: Encountered {len(errors)} payload errors during bulk index transfer processing.")
-
-    return len(batch_list)
-
-
-
 # async def populate_search_engine(csv_path: str):
 #     """
 #     Parses the provided CSV file, inserts records into PostgreSQL using ORM models

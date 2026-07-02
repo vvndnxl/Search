@@ -59,7 +59,7 @@ $DOCKER_COMPOSE_CMD build --no-cache api
 echo "Running tests stream against container database layout..."
 $DOCKER_COMPOSE_CMD run --rm \
   -v "$(pwd)/pytest.ini:/app/pytest.ini" \
-  -v "$(pwd)/data.csv:/app/data.csv" \
+  -v "$(pwd)/tests/test_data.csv:/app/tests/test_data.csv" \
   api pytest -v tests/
 
 echo "HYPER-FAST TESTS SUITE RUN FINISHED"

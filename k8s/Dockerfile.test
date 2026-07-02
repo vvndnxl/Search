@@ -1,0 +1,52 @@
+# =====================================================================
+# СТАДИЯ 1: Builder (Сборка зависимостей)
+# =====================================================================
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Устанавливаем системные зависимости, необходимые для компиляции некоторых python-пакетов
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+# Собираем wheels-пакеты в изолированную директорию
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /build/wheels -r requirements.txt
+
+# =====================================================================
+# СТАДИЯ 2: Runtime (Финальный продакшен-образ)
+# =====================================================================
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+# Устанавливаем curl для работы K8s Readiness/Liveness Probes, если это необходимо
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копируем и устанавливаем уже скомпилированные python-пакеты из первой стадии
+COPY --from=builder /build/wheels /app/wheels
+RUN pip install --no-cache-dir /app/wheels/* && rm -rf /app/wheels
+
+# Копируем исходный код приложения
+COPY . .
+
+# Создаем не-привилегированного пользователя для безопасности (Security Context в K8s)
+RUN useradd -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+# Дефолтная команда для веб-сервера (Воркер переопределит её на уровне манифеста)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

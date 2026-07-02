@@ -1,0 +1,35 @@
+apiVersion: apps/apps/v1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search-worker
+  namespace: default
+  labels:
+    app: search-worker
+spec:
+  replicas: 1 # Для последовательного консюминга топика оставляем 1 реплику
+  selector:
+    matchLabels:
+      app: search-worker
+  template:
+    metadata:
+      labels:
+        app: search-worker
+    spec:
+      containers:
+        - name: worker-container
+          image: your-docker-registry/search-api:v1.0.0 # Тот же самый образ
+          command: ["python", "-m", "app.worker"] # ПЕРЕОПРЕДЕЛЯЕМ КОМАНДУ НА ЗАПУСК ВОРКЕРА
+          envFrom:
+            - configMapRef:
+                name: search-engine-config
+          env:
+            - name: POSTGRES_PASSWORD
+              value: "postgres"
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+            requests:
+              cpu: "100m"
+              memory: "128Mi"

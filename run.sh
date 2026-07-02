@@ -3,9 +3,7 @@
 # Exit immediately if a command exits with a non-zero status
 set -e
 
-echo "================================================================="
-echo "🔄 RUNNING SYSTEM REBOOT, CACHE PURGE & AUTOMATED TEST PIPELINE"
-echo "================================================================="
+echo "RUNNING SYSTEM REBOOT, CACHE PURGE & AUTOMATED TEST PIPELINE"
 
 # Dynamic command checker mapping 'docker-compose' to modern 'docker compose' if required
 if command -v docker-compose &> /dev/null; then
@@ -37,43 +35,71 @@ echo "Step 3: Compiling un-cached container configurations..."
 $DOCKER_COMPOSE_CMD build --no-cache
 
 echo "Step 4: Spawning base infrastructure containers..."
-$DOCKER_COMPOSE_CMD up -d postgres_db elasticsearch kafka
+$DOCKER_COMPOSE_CMD up -d postgres_db elasticsearch kafka redis
 
-# 4. Wait for core system health checks to finalize database readiness
-echo "Step 5: Awaiting database and full-text search index readiness..."
-until $DOCKER_COMPOSE_CMD ps postgres_db | grep -q "healthy"; do
-    sleep 2
-    echo -n "."
+# 4. Wait for core system health checks to finalize database readiness using native docker inspect
+echo "Step 5: Awaiting database, cache and full-text search index readiness..."
+CHECK_SERVICES=("search_postgres" "search_elastic" "search_kafka" "search_redis")
+MAX_ATTEMPTS=30
+
+for service in "${CHECK_SERVICES[@]}"; do
+    echo -n "Awaiting health status for $service ."
+    attempt=1
+    while [ $attempt -le $MAX_ATTEMPTS ]; do
+        health_status=$(docker inspect --format='{{.State.Health.Status}}' "$service" 2>/dev/null || echo "starting")
+        if [ "$health_status" == "healthy" ]; then
+            echo " [OK]"
+            break
+        fi
+        sleep 2
+        echo -n "."
+        attempt=$((attempt+1))
+    done
+    if [ $attempt -gt $MAX_ATTEMPTS ]; then
+        echo -e "\n❌ CRITICAL: Service $service failed to become healthy in time!"
+        exit 1
+    fi
 done
-until $DOCKER_COMPOSE_CMD ps elasticsearch | grep -q "healthy"; do
-    sleep 2
-    echo -n "."
-done
-echo ""
 
 # 5. AUTOMATED INTEGRATION TESTING STAGE
 echo "Step 6: Provisioning isolated test environments and running test cases..."
-# Generate the mandatory 'test_search_db' inside the running PostgreSQL container
 $DOCKER_COMPOSE_CMD exec -T postgres_db psql -U postgres -d postgres -c "CREATE DATABASE test_search_db;" || true
 
-# Run the test suite inside a temporary, isolated API instance
-# By using '--rm', the test environment container is automatically destroyed afterward
 $DOCKER_COMPOSE_CMD run --rm \
   -v "$(pwd)/pytest.ini:/app/pytest.ini" \
-  -v "$(pwd)/data.csv:/app/data.csv" \
+  -v "$(pwd)/tests/test_data.csv:/app/tests/test_data.csv" \
   api pytest -v tests/
-
 
 # 6. Complete primary application container orchestration
 echo "🚀 Step 7: Launching primary API server and background synchronization worker..."
 $DOCKER_COMPOSE_CMD up -d api worker
 
+echo "Step 8: Performing final cluster validation inspection..."
+FINAL_SERVICES=("search_api" "search_worker")
+
+for service in "${FINAL_SERVICES[@]}"; do
+    echo -n "Verifying startup stability for $service ."
+    # API и воркер запускаются быстро, даем 5 попыток
+    for attempt in {1..5}; do
+        is_running=$(docker inspect --format='{{.State.Running}}' "$service" 2>/dev/null || echo "false")
+        if [ "$is_running" == "true" ]; then
+            echo " [ONLINE]"
+            break
+        fi
+        sleep 2
+        echo -n "."
+        if [ $attempt -eq 5 ]; then
+            echo -e "\n❌ CRITICAL CRASH DETECTION: $service failed to maintain runtime stability!"
+            docker logs "$service" || true
+            exit 1
+        fi
+    done
+done
+
 echo ""
 echo " DEPLOYMENT FINALIZED SUCCESSFULLY"
-echo ""
-echo "API Engine Online:   http://localhost:8000/docs"
-echo "🔍 Elasticsearch Node:  http://localhost:9200"
-echo ""
+echo "API Engine Online:      http://localhost:8000/docs"
+echo "Elasticsearch Node:   http://localhost:9200"
 echo "Next steps:"
 echo "   1) Run 'python -m app.generate_openapi' to extract your 'docs.json' contract."
 echo "   2) Run 'python -m app.etl_pipeline' to chunk-stream your source 'data.csv'."

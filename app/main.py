@@ -1,6 +1,5 @@
 import json
 import logging
-
 import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, status, HTTPException, Query
@@ -8,14 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from elasticsearch import AsyncElasticsearch
 from redis.asyncio import Redis
 
-# Import your new dependencies and services
-from app.database import get_db_session, get_redis_ctx, create_elastic_client, verify_and_setup_elastic_index, \
-    create_kafka_producer, redis_pool, get_elastic_ctx, get_kafka_ctx
+from app.database import get_db_session, get_redis_ctx, create_elastic_client, redis_pool, get_elastic_ctx, get_kafka_ctx, init_infrastructure, close_infrastructure
 from app.config import settings
-from app.redis_service import get_cached_search_results, set_search_results_cache, invalidate_search_cache
-
-from app.repositories import PostgresRepository, ElasticRepository
-from app.services import DocumentService
+from app.redis_service import get_cached_search_results, set_search_results_cache
 from app.models import DocumentResponse, MessageResponse, DocumentModel
 
 logger = logging.getLogger("app.main")
@@ -25,12 +19,27 @@ logger = logging.getLogger("app.main")
 async def lifespan(app: FastAPI):
     """Manages system startup and shutdown loops gracefully."""
     logger.info("Booting up API service layer mesh...")
-    yield
-    logger.info("Shutting down API service layer mesh...")
-    # Cleanly disconnect connection pools to prevent network descriptor leakage
-    await redis_pool.disconnect()
-    logger.info("Redis connection pools released successfully.")
 
+    # Интегрируем жесткий Fail-Fast контроль синглтонов инфраструктуры при старте
+    try:
+        await init_infrastructure()
+    except Exception as infra_err:
+        logger.critical(f"💥 [FATAL STARTUP BLOCKED] Infrastructure mesh failed to align: {infra_err}")
+        raise infra_err  # Роняем приложение, не запуская uvicorn
+
+    yield
+
+    logger.info("Shutting down API service layer mesh...")
+
+    # Безопасно закрываем глобальные синглтоны Elastic и Kafka
+    await close_infrastructure()
+
+    # Сохраняем вашу оригинальную логику очистки пулов Redis
+    try:
+        await redis_pool.disconnect()
+        logger.info("Redis connection pools released successfully.")
+    except Exception as e:
+        logger.warning(f"Error disconnecting Redis pool during shutdown: {e}")
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -47,24 +56,16 @@ async def search_documents_endpoint(
         es: AsyncElasticsearch = Depends(get_elastic_ctx),
         redis: Redis = Depends(get_redis_ctx)
 ):
-    """
-    Executes a resilient read-through lookup sequence.
-    Utilizes clean, modern Elasticsearch 9.x search payload parameters
-    to permanently clear all keyword overlap deprecation warnings.
-    """
     cleaned_query = query.strip()
     if not cleaned_query:
         return []
 
-    # Step A: Protected read pass from the caching layer
     cached_payload = await get_cached_search_results(redis, cleaned_query)
     if cached_payload is not None:
         return cached_payload
 
     logger.info(f"🔍 [CACHE MISS] Routing search token '{cleaned_query}' to backend engines.")
 
-    # Step B: Standardize modern Elasticsearch query parameters
-    # FIX: Merged the size attribute directly inside the body payload array to remove deprecations
     search_body = {
         "size": 100,
         "query": {
@@ -88,21 +89,13 @@ async def search_documents_endpoint(
         await set_search_results_cache(redis, cleaned_query, [], ttl=settings.CACHE_TTL_SECONDS)
         return []
 
-    matched_ids = []
-    for hit in hits:
-        hit_id = hit.get("_id")
-        source_id = hit.get("_source", {}).get("id")
-        logger.info(f"🔍 [MAIN API] Трейс Хита -> Системный _id: '{hit_id}', ID в _source: '{source_id}'")
-        if hit_id is not None:
-            matched_ids.append(int(hit_id))
+    matched_ids = [int(hit["_id"]) for hit in hits]
 
-    # Fetch complete relational records matching targeted criteria
     from sqlalchemy import select
     stmt = select(DocumentModel).where(DocumentModel.id.in_(matched_ids))
     db_result = await db.execute(stmt)
     documents = db_result.scalars().all()
 
-    # Enforce priority creation date sorting sequence and cap limits at 20 rows
     sorted_docs = sorted(documents, key=lambda d: d.created_date, reverse=True)[:20]
 
     response_payload = [
@@ -115,9 +108,7 @@ async def search_documents_endpoint(
         for doc in sorted_docs
     ]
 
-    # Step C: Hydrate cache safely
     await set_search_results_cache(redis, cleaned_query, response_payload, ttl=settings.CACHE_TTL_SECONDS)
-
     return response_payload
 
 
@@ -127,10 +118,6 @@ async def delete_document_endpoint(
     db: AsyncSession = Depends(get_db_session),
     kafka_producer=Depends(get_kafka_ctx)
 ):
-    """
-    Deletes the resource from the relational database and offloads sync tasks to Kafka.
-    Redis eviction is handled asynchronously by the Kafka background consumer loop.
-    """
     doc = await db.get(DocumentModel, document_id)
     if not doc:
         raise HTTPException(
@@ -138,22 +125,75 @@ async def delete_document_endpoint(
             detail=f"Document with ID {document_id} not found."
         )
 
+    # Шаг 1: Удаляем из основного источника правды (Postgres ACID транзакция)
     await db.delete(doc)
     await db.commit()
 
-    await kafka_producer.send_and_wait(
-        settings.KAFKA_TOPIC,
-        key=str(document_id).encode("utf-8"),
-        value=json.dumps({"action": "DELETE", "id": document_id}).encode("utf-8")
-    )
+    # Шаг 2: Попытка асинхронной публикации в Kafka (с обработкой падения брокера)
+    try:
+        await kafka_producer.send_and_wait(
+            settings.KAFKA_TOPIC,
+            key=str(document_id).encode("utf-8"),
+            value=json.dumps({"action": "DELETE", "id": document_id}).encode("utf-8")
+        )
+        return {"detail": f"Document deletion task submitted for ID {document_id}."}
+    except Exception as kafka_err:
+        # Graceful Degradation: БД очищена, но синхронизация ES отложена
+        logger.critical(
+            f"⚠️ [KAFKA OFFLINE] Failed to stream delete event for ID {document_id}: {kafka_err}. "
+            f"Database mutation succeeded, but sync queue requires manual replay or DLQ processing."
+        )
+        return {
+            "detail": f"Document ID {document_id} removed from DB, but sync queue was offline. Changes will reflect asynchronously later."
+        }
 
-    return {"detail": f"Document deletion task submitted for ID {document_id}."}
+
+@app.get("/api/v1/health", status_code=status.HTTP_200_OK)
+async def health_check_endpoint(
+    db: AsyncSession = Depends(get_db_session),
+    es: AsyncElasticsearch = Depends(get_elastic_ctx),
+    redis: Redis = Depends(get_redis_ctx)
+):
+    """Комплексный healthcheck с разделением на критические и терпимые сбои."""
+    health_status = {
+        "status": "healthy",
+        "services": {"postgres": "unhealthy", "elasticsearch": "unhealthy", "redis": "unhealthy"}
+    }
+    critical_error = False
+
+    # 1. Проверка критической Postgres
+    try:
+        from sqlalchemy import text
+        await db.execute(text("SELECT 1"))
+        health_status["services"]["postgres"] = "healthy"
+    except Exception as e:
+        health_status["services"]["postgres"] = f"unhealthy: {str(e)}"
+        critical_error = True
+
+    # 2. Проверка критического Elasticsearch
+    try:
+        es_health = await es.cluster.health()
+        health_status["services"]["elasticsearch"] = f"healthy (status: {es_health.get('status')})"
+    except Exception as e:
+        health_status["services"]["elasticsearch"] = f"unhealthy: {str(e)}"
+        critical_error = True
+
+    # 3. Проверка МЯГКОЙ зависимости Redis (Не роняет весь API)
+    try:
+        await redis.ping()
+        health_status["services"]["redis"] = "healthy"
+    except Exception as e:
+        health_status["services"]["redis"] = f"unhealthy (degraded state): {str(e)}"
+        # Если лежит только Redis, переводим статус в degraded, но НЕ взводим critical_error
+        if not critical_error:
+            health_status["status"] = "degraded"
+
+    if critical_error:
+        health_status["status"] = "unhealthy"
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=health_status)
+
+    return health_status
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True
-    )
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

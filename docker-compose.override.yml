@@ -1,0 +1,10 @@
+services:
+  postgres_db:
+    image: dockerhub.timeweb.cloud/library/postgres:15-alpine
+
+  elasticsearch:
+    image: dockerhub.timeweb.cloud/library/elasticsearch:9.4.1
+
+  kafka:
+    image: dockerhub.timeweb.cloud/confluentinc/cp-kafka:7.4.0
+

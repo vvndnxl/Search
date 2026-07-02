@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: search-engine-config
+  namespace: default
+data:
+  POSTGRES_HOST: "prod-postgres-service.internal" # Укажите хост вашей внешней БД
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: "postgres"
+  POSTGRES_DB: "search_db"
+  ELASTIC_HOST: "prod-elasticsearch-service.internal" # Укажите хост внешнего ES
+  ELASTIC_PORT: "9200"
+  ELASTIC_INDEX: "documents"
+  KAFKA_BOOTSTRAP_SERVERS: "prod-kafka-service.internal:9092" # Укажите хост внешней Kafka
+  KAFKA_TOPIC: "document_sync"
+  REDIS_HOST: "prod-redis-service.internal" # Укажите хост внешнего Redis
+  REDIS_PORT: "6379"
+  CACHE_TTL_SECONDS: "300"

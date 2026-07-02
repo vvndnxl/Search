@@ -149,13 +149,18 @@ async def client(mock_kafka):
 @pytest.fixture(scope="session")
 def raw_csv_documents():
     """
-    Парсит записи из data.csv, генерируя гарантированно уникальные
-    последовательные ID, полностью исключая ошибки UniqueViolationError.
+    ИСПРАВЛЕНО: Читает легкий изолированный тестовый CSV-файл из папки тестов.
+    Защищает контейнер от переполнения памяти (OOM) и гарантирует мгновенный старт.
     """
-    csv_path = "/app/data.csv"
+    # Переключаем путь на тестовый слепок файла
+    csv_path = "/app/tests/test_data.csv"
     processed_records = []
+
     if not os.path.exists(csv_path):
-        return processed_records
+        # Фолбэк на случай, если запуск идет локально без докера
+        csv_path = "tests/test_data.csv"
+        if not os.path.exists(csv_path):
+            return processed_records
 
     with open(csv_path, mode="r", encoding="utf-8") as file:
         reader = csv.DictReader(file)
@@ -163,8 +168,6 @@ def raw_csv_documents():
             try:
                 rubrics_list = eval(row["rubrics"]) if row["rubrics"].startswith("[") else [row["rubrics"]]
                 created_dt = datetime.strptime(row["created_date"], "%Y-%m-%d %H:%M:%S")
-
-                # Возвращаем абсолютно надежный инкремент, защищенный от дубликатов текста в CSV
                 doc_id = idx + 1
 
                 processed_records.append({
@@ -173,6 +176,10 @@ def raw_csv_documents():
                     "text": row["text"],
                     "created_date": created_dt
                 })
+
+                # Дополнительный предохранитель: берем не более 100 строк для тестов
+                if len(processed_records) >= 100:
+                    break
             except Exception:
                 continue
     return processed_records
