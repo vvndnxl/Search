@@ -1,0 +1,25 @@
+# Локальные переменные окружения (Строго не для отправки)
+.env
+
+# PyCharm / JetBrains метаданные
+.idea/
+.run/
+
+# Python кэш и компиляция
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.egs/
+*.egg-info/
+wheelhouse/
+
+
+# Файлы данных (если data.csv весит много или содержит локальные правки)
+# data.csv
+
+# Локальные системные файлы
+.DS_Store
+Thumbs.db
+docker-compose.override.yml
