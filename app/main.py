@@ -6,12 +6,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, status, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from elasticsearch import AsyncElasticsearch
-from aiokafka import AIOKafkaProducer
 from redis.asyncio import Redis
 
 # Import your new dependencies and services
 from app.database import get_db_session, get_redis_ctx, create_elastic_client, verify_and_setup_elastic_index, \
-    create_kafka_producer, redis_pool
+    create_kafka_producer, redis_pool, get_elastic_ctx, get_kafka_ctx
 from app.config import settings
 from app.redis_service import get_cached_search_results, set_search_results_cache, invalidate_search_cache
 
@@ -20,10 +19,6 @@ from app.services import DocumentService
 from app.models import DocumentResponse, MessageResponse, DocumentModel
 
 logger = logging.getLogger("app.main")
-
-# =====================================================================
-# 1. CLEAN APP LIFESPAN
-# =====================================================================
 
 
 @asynccontextmanager
@@ -45,33 +40,7 @@ app = FastAPI(
 )
 
 
-# =====================================================================
-# 2. LOCALIZED REQUEST-SCOPED CONNECTION GENERATORS
-# =====================================================================
-async def get_elastic_ctx():
-    """Yields a request-scoped, safely isolated Elasticsearch client context."""
-    client = create_elastic_client()
-    try:
-        yield client
-    finally:
-        await client.close()
-
-
-async def get_kafka_ctx():
-    """Yields a request-scoped Kafka producer context bound to the active thread."""
-    producer = create_kafka_producer()
-    await producer.start()
-    try:
-        yield producer
-    finally:
-        await producer.stop()
-
-
-# =====================================================================
-# 3. HTTP CONTROLLERS (Endpoints)
-# =====================================================================
-
-@app.get("/api/v1/search")
+@app.get("/api/v1/search", response_model=list[DocumentResponse])
 async def search_documents_endpoint(
         query: str = Query(..., min_length=1),
         db: AsyncSession = Depends(get_db_session),
@@ -100,10 +69,7 @@ async def search_documents_endpoint(
         "size": 100,
         "query": {
             "match": {
-                "text": {
-                    "query": cleaned_query,
-                    "analyzer": "russian"
-                }
+                "text": {"query": cleaned_query, "analyzer": "russian"}
             }
         }
     }
@@ -122,7 +88,13 @@ async def search_documents_endpoint(
         await set_search_results_cache(redis, cleaned_query, [], ttl=settings.CACHE_TTL_SECONDS)
         return []
 
-    matched_ids = [int(hit["_id"]) for hit in hits]
+    matched_ids = []
+    for hit in hits:
+        hit_id = hit.get("_id")
+        source_id = hit.get("_source", {}).get("id")
+        logger.info(f"🔍 [MAIN API] Трейс Хита -> Системный _id: '{hit_id}', ID в _source: '{source_id}'")
+        if hit_id is not None:
+            matched_ids.append(int(hit_id))
 
     # Fetch complete relational records matching targeted criteria
     from sqlalchemy import select
@@ -178,9 +150,6 @@ async def delete_document_endpoint(
     return {"detail": f"Document deletion task submitted for ID {document_id}."}
 
 
-# =====================================================================
-# 4. APPLICATION ENTRYPOINT
-# =====================================================================
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",

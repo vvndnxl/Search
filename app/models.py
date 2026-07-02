@@ -14,7 +14,8 @@ class DocumentModel(Base):
     id = Column(Integer, primary_key=True, index=True)
     rubrics = Column(JSONB, nullable=False)  # Массив рубрик в формате JSONB
     text = Column(Text, nullable=False)
-    created_date = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+    created_date = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, index=True)
 
 
 # =====================================================================

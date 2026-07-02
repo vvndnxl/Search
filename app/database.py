@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from elasticsearch import AsyncElasticsearch
@@ -6,8 +8,7 @@ from app.config import settings
 from redis.asyncio import Redis, ConnectionPool
 from app.config import settings
 
-
-
+logger = logging.getLogger("app.database")
 
 engine = create_async_engine(
     settings.DATABASE_URL,
@@ -31,17 +32,65 @@ redis_pool = ConnectionPool(
 Base = declarative_base()
 
 
-async def get_redis_ctx() -> Redis:
+def create_elastic_client() -> AsyncElasticsearch:
     """
-    Yields an active redis client connection token from the shared state pool.
-    Designed for clean resource injection across standard FastAPI dependency layers.
+    Creates an optimized, resilient modern asynchronous Elasticsearch 9.x client.
+    Configured with a fail-fast request timeout to prevent FastAPI threads
+    from locking up indefinitely during unexpected cluster latency spikes.
     """
-    client = Redis(connection_pool=redis_pool)
+    return AsyncElasticsearch(
+        hosts=[f"http://{settings.ELASTIC_HOST}:{settings.ELASTIC_PORT}"],
+        meta_header=True,
+        request_timeout=5.0,  # Guardrail: Fail fast after 5s instead of blocking threads
+        max_retries=3,        # Automatic recovery for transient dropped packets
+        retry_on_timeout=True
+    )
+
+
+async def get_redis_ctx():
+    """
+    Dynamically initializes a loop-bound Redis connection pool.
+    Enforces maximum connection limits to protect memory footprints
+    and avoid connection leakage under high-concurrency conditions.
+    """
+    pool = ConnectionPool(
+        host=settings.REDIS_HOST,
+        port=settings.REDIS_PORT,
+        db=settings.REDIS_DB,
+        decode_responses=True,
+        max_connections=50,       # Guardrail: Cap maximum connections per worker task loop
+        socket_timeout=3.0,       # Network fail-fast threshold
+        socket_connect_timeout=3.0
+    )
+    client = Redis(connection_pool=pool)
+    try:
+        yield client
+    except Exception as e:
+        logger.error(f"⚠️ [DATABASE] Unexpected exception trapped inside Redis lifecycle hook: {e}")
+        raise
+    finally:
+        # Guarantee that sockets are released back to the OS descriptor cache under all circumstances
+        await client.aclose()
+        await pool.disconnect()
+
+
+async def get_elastic_ctx():
+    """Yields a request-scoped, safely isolated Elasticsearch client context."""
+    client = create_elastic_client()
     try:
         yield client
     finally:
-        # Closes the client interface tracking session without dropping the global pool
         await client.close()
+
+
+async def get_kafka_ctx():
+    """Yields a request-scoped Kafka producer context bound to the active thread."""
+    producer = create_kafka_producer()
+    await producer.start()
+    try:
+        yield producer
+    finally:
+        await producer.stop()
 
 
 async def get_db_session():
@@ -51,17 +100,6 @@ async def get_db_session():
             yield session
         finally:
             await session.close()
-
-
-def create_elastic_client() -> AsyncElasticsearch:
-    """
-    Creates a clean, native, modern asynchronous Elasticsearch 9.x client.
-    No more legacy header workarounds, reflection patches, or node pool mutations.
-    """
-    return AsyncElasticsearch(
-        hosts=[f"http://{settings.ELASTIC_HOST}:{settings.ELASTIC_PORT}"],
-        meta_header=True  # Standard modern library telemetry
-    )
 
 
 def create_kafka_producer() -> AIOKafkaProducer:
